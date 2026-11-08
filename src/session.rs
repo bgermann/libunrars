@@ -147,6 +147,8 @@ pub struct Handle {
     disk_written: u64,
     cut_tail: bool,
     no_main: bool,
+    deferred_open: bool,
+    volume_missing: bool,
     solid: bool,
     volumes_loaded: bool,
     cursor: usize,
@@ -500,6 +502,8 @@ impl Handle {
             disk_written: 0,
             cut_tail: false,
             no_main: false,
+            deferred_open: false,
+            volume_missing: false,
             solid: false,
             volumes_loaded: false,
             cursor: 0,
@@ -507,27 +511,40 @@ impl Handle {
             worker: None,
             abort_code: None,
         };
+        // Encrypted headers without a password do not fail the open: as in
+        // libunrar the password may still arrive via RARSetPassword, and the
+        // failure surfaces from the first RARReadHeader instead.
+        match h.open_first(true) {
+            Ok(()) => {}
+            Err(ERAR_MISSING_PASSWORD) => h.deferred_open = true,
+            Err(code) => return Err(code),
+        }
+        Ok(h)
+    }
+
+    fn open_first(&mut self, ask: bool) -> Result<(), c_int> {
         let first = loop {
-            match open_path(&path_of(&h.arc_name), h.password.as_deref()) {
+            match open_path(&path_of(&self.arc_name), self.password.as_deref()) {
                 Ok((a, cut)) => {
-                    h.cut_tail = cut == 1;
-                    h.no_main = cut == 2;
+                    self.cut_tail = cut == 1;
+                    self.no_main = cut == 2;
                     break a;
                 }
-                Err(e) if e.kind() == rars::ErrorKind::PasswordRequired && h.password.is_none() => {
-                    if !h.ask_password() {
+                Err(e) if e.kind() == rars::ErrorKind::PasswordRequired && self.password.is_none() => {
+                    if !ask || !self.ask_password() {
                         return Err(ERAR_MISSING_PASSWORD);
                     }
                 }
                 Err(e) => return Err(map_error(&e, true)),
             }
         };
-        h.archives.push(first);
-        h.volume_paths.push(h.arc_name.clone());
-        if !has_next_volume(&h.archives[0]) {
-            h.finish_loading();
+        self.archives.push(first);
+        self.volume_paths.push(self.arc_name.clone());
+        if !has_next_volume(&self.archives[0]) {
+            self.finish_loading();
         }
-        Ok(h)
+        self.deferred_open = false;
+        Ok(())
     }
 
     pub fn first_archive(&self) -> &Archive {
@@ -535,6 +552,9 @@ impl Handle {
     }
 
     pub fn open_flags(&self) -> u32 {
+        if self.archives.is_empty() {
+            return ROADF_ENCHEADERS | ROADF_NEWNUMBERING;
+        }
         match self.first_archive() {
             Archive::Rar50Plus(x) => {
                 let m = &x.main;
@@ -615,8 +635,27 @@ impl Handle {
         buf[..n].copy_from_slice(&path[..n]);
         let ok = unsafe {
             if let Some(cb) = self.callback {
-                let msg = UCM_CHANGEVOLUME;
-                cb(msg, self.user_data, buf.as_mut_ptr() as LPARAM, mode as LPARAM) != -1
+                // As in libunrar, offer the wide message first; a client that
+                // rejects it (-1) refuses the volume, otherwise the narrow one follows.
+                let mut wide: Vec<wchar> = String::from_utf8_lossy(&buf[..n])
+                    .chars()
+                    .flat_map(|c| {
+                        let mut b = [0; 2];
+                        wide_encode(c, &mut b).to_vec()
+                    })
+                    .collect();
+                wide.resize(wide.len().max(NM) , 0);
+                let wide_ok = cb(UCM_CHANGEVOLUMEW, self.user_data, wide.as_mut_ptr() as LPARAM, mode as LPARAM) != -1;
+                if wide_ok && mode == RAR_VOL_ASK {
+                    let len = wide.iter().position(|&c| c == 0).unwrap_or(NM);
+                    let new = wide_decode(&wide[..len]).into_bytes();
+                    if new != buf[..n] {
+                        buf.fill(0);
+                        let m = new.len().min(NM - 1);
+                        buf[..m].copy_from_slice(&new[..m]);
+                    }
+                }
+                wide_ok && cb(UCM_CHANGEVOLUME, self.user_data, buf.as_mut_ptr() as LPARAM, mode as LPARAM) != -1
             } else if let Some(p) = self.change_vol {
                 p(buf.as_mut_ptr() as *mut c_char, mode) != 0
             } else {
@@ -786,12 +825,21 @@ impl Handle {
         if self.volumes_loaded {
             return Ok(());
         }
-        self.load_volumes()?;
+        // A missing volume only matters once a member continuing into it is
+        // processed, so the members of the volumes found so far stay readable.
+        match self.load_volumes() {
+            Ok(()) => {}
+            Err(ERAR_EOPEN) => self.volume_missing = true,
+            Err(code) => return Err(code),
+        }
         self.finish_loading();
         Ok(())
     }
 
     pub fn comment(&self) -> Result<Option<Vec<u8>>, c_int> {
+        if self.archives.is_empty() {
+            return Ok(None);
+        }
         self.first_archive()
             .comment(self.password.as_deref())
             .map_err(|e| map_error(&e, false))
@@ -800,6 +848,9 @@ impl Handle {
     pub fn read_header(&mut self) -> Result<Header, c_int> {
         if let Some(code) = self.poison {
             return Err(code);
+        }
+        if self.deferred_open {
+            self.open_first(true)?;
         }
         self.ensure_loaded()?;
         let Some(_) = self.headers.get(self.cursor) else {
@@ -852,6 +903,12 @@ impl Handle {
         }
         if self.workable() && op != RAR_SKIP && self.members[idx].meta.is_split_before {
             return ERAR_BAD_DATA;
+        }
+        if self.volume_missing
+            && idx + 1 == self.headers.len()
+            && self.headers[idx].meta.is_split_after
+        {
+            return ERAR_EOPEN;
         }
         self.notify_volumes(self.header_end_volume[idx]);
         if !self.workable() {
