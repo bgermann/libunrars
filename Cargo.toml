@@ -1,0 +1,23 @@
+[package]
+name = "unrars"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "A libunrar-compatible C ABI implemented on top of the rars crate"
+license = "0BSD"
+repository = "https://github.com/bgermann/libunrars"
+
+[lib]
+name = "unrars"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+rars = { version = "0.12", default-features = false, features = ["encryption"] }
+libc = "0.2"
+
+[dev-dependencies]
+rars = { version = "0.12", features = ["write"] }
+
+[profile.release]
+panic = "unwind"
+lto = true
