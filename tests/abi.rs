@@ -162,6 +162,63 @@ fn processdata_callback_can_abort() {
 }
 
 #[test]
+fn legacy_unix_symlink_is_reported_and_extracted() {
+    use rars::rar15_40::{write_stored_archive, StoredEntry, WriterOptions};
+
+    unsafe extern "system" fn cb(msg: u32, ud: isize, _p1: isize, _p2: isize) -> i32 {
+        if msg == UCM_PROCESSDATA {
+            unsafe { *(ud as *mut u32) += 1 };
+        }
+        0
+    }
+
+    let dir = scratch("legacy-link");
+    let arc = dir.join("a.rar");
+    let entry = StoredEntry {
+        name: b"link",
+        data: b"target.txt",
+        file_time: 0,
+        file_attr: 0o120777,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let bytes = write_stored_archive(
+        &[entry],
+        WriterOptions::new(ArchiveVersion::Rar40, rars::FeatureSet::store_only()),
+    )
+    .unwrap();
+    std::fs::write(&arc, bytes).unwrap();
+
+    let out = dir.join("out");
+    let out_c = CString::new(out.to_str().unwrap()).unwrap();
+    let mut chunks = 0u32;
+    unsafe {
+        let (h, res) = open(&arc, RAR_OM_EXTRACT);
+        assert_eq!(res, 0);
+        RARSetCallback(h, Some(cb), &mut chunks as *mut u32 as isize);
+        let hd = header(h).unwrap();
+        assert_eq!(name_of(&hd), "link");
+        let redir_type = hd.RedirType;
+        assert_eq!(redir_type, 1);
+        // Link payloads are consumed silently, as in libunrar.
+        assert_eq!(RARProcessFile(h, RAR_TEST, out_c.as_ptr() as *mut _, std::ptr::null_mut()), 0);
+        assert_eq!(chunks, 0);
+        assert_eq!(RARCloseArchive(h), 0);
+    }
+    unsafe {
+        let (h, res) = open(&arc, RAR_OM_EXTRACT);
+        assert_eq!(res, 0);
+        header(h).unwrap();
+        assert_eq!(RARProcessFile(h, RAR_EXTRACT, out_c.as_ptr() as *mut _, std::ptr::null_mut()), 0);
+        assert_eq!(RARCloseArchive(h), 0);
+    }
+    #[cfg(unix)]
+    assert_eq!(std::fs::read_link(out.join("link")).unwrap(), std::path::Path::new("target.txt"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_errors() {
     let dir = scratch("errors");
     unsafe {

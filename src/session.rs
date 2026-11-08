@@ -189,6 +189,16 @@ fn path_of(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Legacy (RAR 1.5-4.x) Unix symlinks store their target as the member payload.
+/// Only HOST_UNIX records get this interpretation; BeOS uses Unix mode bits for
+/// permissions but its payloads are ordinary files.
+fn is_legacy_unix_symlink(m: &ArchiveMember) -> bool {
+    m.meta.family == ArchiveFamily::Rar15To40
+        && m.meta.host_os == Some(3)
+        && m.meta.file_attr & !0o7777 == 0o120000
+        && !m.meta.is_directory
+}
+
 fn archive_solid(a: &Archive) -> bool {
     match a {
         Archive::Rar13(x) => x.main.is_solid(),
@@ -891,6 +901,20 @@ impl Handle {
                 Err(c) => c,
             };
         }
+        if is_legacy_unix_symlink(&member) {
+            if op == RAR_EXTRACT {
+                return self.extract_legacy_symlink(idx, &member, &dest);
+            }
+            if op == RAR_TEST {
+                // libunrar consumes the stored target without invoking the
+                // process-data callback for legacy link payloads.
+                let mut sink = Sink { file: None, block: Vec::new(), memory: None, quiet: true };
+                return match self.sync(idx, Cmd::Extract, Some(&mut sink)) {
+                    Ok(()) => ERAR_SUCCESS,
+                    Err(c) => c,
+                };
+            }
+        }
 
         let mut out = None;
         if op == RAR_EXTRACT {
@@ -907,7 +931,7 @@ impl Handle {
                 }
             }
         }
-        let mut sink = Sink { file: out, block: Vec::new() };
+        let mut sink = Sink { file: out, block: Vec::new(), memory: None, quiet: false };
         let result = self.sync(idx, Cmd::Extract, Some(&mut sink));
         let mut code = match result {
             Ok(()) => ERAR_SUCCESS,
@@ -929,6 +953,35 @@ impl Handle {
             }
         }
         code
+    }
+
+    /// Legacy (RAR 1.5-4.x) Unix symlinks store the target as ordinary payload
+    /// data. Collect it and create the link, matching libunrar's RAR_EXTRACT.
+    fn extract_legacy_symlink(&mut self, idx: usize, member: &ArchiveMember, dest: &Path) -> c_int {
+        let mut sink = Sink { file: None, block: Vec::new(), memory: Some(Vec::new()), quiet: true };
+        if let Err(c) = self.sync(idx, Cmd::Extract, Some(&mut sink)) {
+            return c;
+        }
+        let target = sink.memory.take().unwrap_or_default();
+        if target.is_empty() || target.contains(&0) {
+            return ERAR_EREFERENCE;
+        }
+        let target = path_of(&target);
+        let unsafe_target = target.is_absolute()
+            || target.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
+        if unsafe_target {
+            return ERAR_EREFERENCE;
+        }
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if std::fs::create_dir_all(parent).is_err() {
+                return ERAR_ECREATE;
+            }
+        }
+        let _ = std::fs::remove_file(dest);
+        match symlink(&target, dest, member.meta.is_directory) {
+            Ok(()) => ERAR_SUCCESS,
+            Err(_) => ERAR_ECREATE,
+        }
     }
 
     fn start_worker(&mut self) -> Result<(), c_int> {
@@ -1037,7 +1090,10 @@ impl Handle {
                                 ok = false;
                             }
                         }
-                        if ok && !self.report_data(&data) {
+                        if let Some(m) = sink.as_deref_mut().and_then(|s| s.memory.as_mut()) {
+                            m.extend_from_slice(&data);
+                        }
+                        if ok && !sink.as_deref().is_some_and(|s| s.quiet) && !self.report_data(&data) {
                             self.abort_code = Some(ERAR_UNKNOWN);
                             ok = false;
                         }
@@ -1071,8 +1127,11 @@ impl Handle {
                 return false;
             }
         }
+        if let Some(m) = s.memory.as_mut() {
+            m.extend_from_slice(block);
+        }
         self.disk_written += block.len() as u64;
-        if !self.report_data(block) {
+        if !s.quiet && !self.report_data(block) {
             self.abort_code = Some(ERAR_UNKNOWN);
             return false;
         }
@@ -1108,6 +1167,10 @@ impl Handle {
 struct Sink {
     file: Option<BufWriter<std::fs::File>>,
     block: Vec<u8>,
+    /// Optional in-memory target, used to read legacy Unix symlink payloads.
+    memory: Option<Vec<u8>>,
+    /// Suppress process-data callbacks (libunrar does this for link payloads).
+    quiet: bool,
 }
 
 // Writes are admitted against the disk limit in blocks of this size.
@@ -1215,6 +1278,11 @@ fn make_header(m: &ArchiveMember, legacy_flags: Option<u16>) -> Header {
         ctime: 0,
         atime: 0,
     };
+    // libunrar reports RAR 1.5-4.x Unix symlinks as redirections of type 1
+    // without a redir_name; the target lives in the member payload.
+    if is_legacy_unix_symlink(m) {
+        h.redir_type = 1;
+    }
     match &m.detail {
         ArchiveMemberDetail::Rar13 { method, unpack_version, file_checksum, .. } => {
             let _ = unpack_version;
