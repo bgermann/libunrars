@@ -25,12 +25,17 @@ fn build(format: ArchiveVersion, solid: bool, password: Option<&[u8]>) -> Vec<u8
 }
 
 unsafe fn open(path: &std::path::Path, mode: u32) -> (*mut c_void, u32) {
+    let (h, result, _) = open_with_flags(path, mode);
+    (h, result)
+}
+
+unsafe fn open_with_flags(path: &std::path::Path, mode: u32) -> (*mut c_void, u32, u32) {
     let name = CString::new(path.to_str().unwrap()).unwrap();
     let mut d: RAROpenArchiveDataEx = std::mem::zeroed();
     d.ArcName = name.as_ptr() as *mut c_char;
     d.OpenMode = mode;
     let h = RAROpenArchiveEx(&mut d);
-    (h, d.OpenResult)
+    (h, d.OpenResult, d.Flags)
 }
 
 unsafe fn header(h: *mut c_void) -> Result<Box<RARHeaderDataEx>, i32> {
@@ -135,6 +140,35 @@ fn passwords() {
             RARCloseArchive(h);
         }
     }
+}
+
+#[test]
+fn encrypted_headers_open_without_password() {
+    let dir = scratch("encrypted-headers");
+    let arc = dir.join("a.rar");
+    let mut b = Builder::new(ArchiveVersion::Rar50)
+        .password(Some(b"pw".to_vec()))
+        .header_encryption(true);
+    b.add_bytes(b"one.bin".to_vec(), payload(), Some(1_600_000_000), Some(0o100640))
+        .unwrap();
+    std::fs::write(&arc, b.to_bytes().unwrap()).unwrap();
+
+    unsafe {
+        // As in libunrar, the archive opens even though the headers cannot be
+        // decrypted yet. The password may arrive later through RARSetPassword.
+        let (h, res, flags) = open_with_flags(&arc, RAR_OM_LIST);
+        assert_eq!(res, 0);
+        assert!(!h.is_null());
+        assert_ne!(flags & ROADF_ENCHEADERS, 0);
+        assert_eq!(header(h).err(), Some(ERAR_MISSING_PASSWORD));
+
+        let pw = CString::new("pw").unwrap();
+        RARSetPassword(h, pw.as_ptr() as *mut _);
+        let hd = header(h).unwrap();
+        assert_eq!(name_of(&hd), "one.bin");
+        assert_eq!(RARCloseArchive(h), 0);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
