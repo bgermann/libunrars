@@ -64,19 +64,56 @@ unsafe fn put_wide(dst: *mut wchar, cap: usize, src: &[u8]) {
     dst.add(n).write(0);
 }
 
+// RAR 3.x stores Unicode comments as UTF-16LE without a marker, so detect
+// them by the high bytes being mostly zero and normalise to UTF-8.
+fn comment_utf8(c: Vec<u8>) -> Vec<u8> {
+    let c = c.strip_prefix(&[0xff, 0xfe][..]).map(<[u8]>::to_vec).unwrap_or(c);
+    if c.len() < 2 || c.len() % 2 != 0 {
+        return c;
+    }
+    let zeros = c.chunks_exact(2).filter(|p| p[1] == 0).count();
+    if zeros * 4 < (c.len() / 2) * 3 {
+        return c;
+    }
+    let units: Vec<u16> = c.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+    String::from_utf16_lossy(&units).into_bytes()
+}
+
 unsafe fn fill_comment(h: &Handle, buf: *mut c_char, size: u32, out_size: *mut u32, out_state: *mut u32) {
     out_size.write_unaligned(0);
     out_state.write_unaligned(0);
     if buf.is_null() || size == 0 {
         return;
     }
-    match h.comment() {
+    match h.comment().map(|c| c.map(comment_utf8)) {
         Ok(Some(c)) => {
             let n = c.len().min(size as usize - 1);
             std::ptr::copy_nonoverlapping(c.as_ptr() as *const c_char, buf, n);
             buf.add(n).write(0);
             out_size.write_unaligned(n as u32 + 1);
             out_state.write_unaligned(if n < c.len() { ERAR_SMALL_BUF as u32 } else { 1 });
+        }
+        Ok(None) => {}
+        Err(code) => out_state.write_unaligned(code as u32),
+    }
+}
+
+unsafe fn fill_comment_wide(h: &Handle, buf: *mut wchar, size: u32, out_size: *mut u32, out_state: *mut u32) {
+    out_size.write_unaligned(0);
+    out_state.write_unaligned(0);
+    match h.comment().map(|c| c.map(comment_utf8)) {
+        Ok(Some(c)) => {
+            put_wide(buf, size as usize, &c);
+            let mut n = 0;
+            while buf.add(n).read() != 0 {
+                n += 1;
+            }
+            let full: usize = String::from_utf8_lossy(&c)
+                .chars()
+                .map(|ch| wide_encode(ch, &mut [0 as wchar; 2]).len())
+                .sum();
+            out_size.write_unaligned(n as u32 + 1);
+            out_state.write_unaligned(if n < full { ERAR_SMALL_BUF as u32 } else { 1 });
         }
         Ok(None) => {}
         Err(code) => out_state.write_unaligned(code as u32),
@@ -144,13 +181,23 @@ pub unsafe extern "system" fn RAROpenArchiveEx(d: *mut RAROpenArchiveDataEx) -> 
                     u64::from(addr_of!((*d).MaxDiskWrite).read_unaligned()) << 20;
                 addr_of_mut!((*d).OpenResult).write_unaligned(0);
                 addr_of_mut!((*d).Flags).write_unaligned(h.open_flags());
-                fill_comment(
-                    &h,
-                    (*d).CmtBuf,
-                    (*d).CmtBufSize,
-                    addr_of_mut!((*d).CmtSize),
-                    addr_of_mut!((*d).CmtState),
-                );
+                if !(*d).CmtBufW.is_null() && (*d).CmtBufSize > 0 {
+                    fill_comment_wide(
+                        &h,
+                        (*d).CmtBufW,
+                        (*d).CmtBufSize,
+                        addr_of_mut!((*d).CmtSize),
+                        addr_of_mut!((*d).CmtState),
+                    );
+                } else {
+                    fill_comment(
+                        &h,
+                        (*d).CmtBuf,
+                        (*d).CmtBufSize,
+                        addr_of_mut!((*d).CmtSize),
+                        addr_of_mut!((*d).CmtState),
+                    );
+                }
                 Box::into_raw(h) as *mut c_void
             }
             Err(code) => {
