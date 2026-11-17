@@ -6,7 +6,7 @@ use crate::abi::*;
 use crate::util::*;
 use rars::{
     Archive, ArchiveFamily, ArchiveMember, ArchiveMemberDetail, ArchiveMemberHash,
-    ArchiveReadOptions, ExtractionDecision, ExtractionErrorAction, FileTimestamp,
+    ArchiveReadOptions, ExtractionDecision, ExtractionErrorAction, StoredTimestamp, Timestamp,
 };
 use std::io::{BufWriter, Write};
 use std::os::raw::{c_char, c_int};
@@ -218,11 +218,11 @@ fn has_next_volume(a: &Archive) -> bool {
         Archive::Rar50Plus(x) => x
             .blocks
             .iter()
-            .any(|b| matches!(b, rars::rar50::Block::End(e) if e.flags & 1 != 0)),
+            .any(|b| matches!(b, rars::rar50::Block::End(e) if e.has_next_volume())),
         Archive::Rar15To40(x) => x
             .blocks
             .iter()
-            .any(|b| matches!(b, rars::rar15_40::Block::End(h) if h.flags & 1 != 0)),
+            .any(|b| matches!(b, rars::rar15_40::Block::End(h) if h.has_next_volume())),
         _ => false,
     }
 }
@@ -1245,8 +1245,10 @@ fn apply_metadata(path: &Path, m: &ArchiveMember) {
         }
     }
     if let Some(t) = m.meta.modification_time() {
-        if let Ok(f) = std::fs::File::open(path) {
-            let _ = f.set_modified(t);
+        if let Ok(t) = std::time::SystemTime::try_from(t) {
+            if let Ok(f) = std::fs::File::open(path) {
+                let _ = f.set_modified(t);
+            }
         }
     }
 }
@@ -1350,7 +1352,10 @@ fn make_header(m: &ArchiveMember, legacy_flags: Option<u16>) -> Header {
             h.crc = u32::from(*file_checksum);
             h.hash_type = RAR_HASH_CRC32;
             h.hash[..4].copy_from_slice(&h.crc.to_le_bytes());
-            h.file_time = meta.file_time.unwrap_or(0);
+            h.file_time = match meta.stored_modification_time() {
+                Some(StoredTimestamp::DosLocal(raw)) => raw,
+                _ => 0,
+            };
         }
         ArchiveMemberDetail::Rar15To40 { method, unpack_version, crc32, .. } => {
             h.host_os = match meta.host_os.unwrap_or(0) {
@@ -1362,12 +1367,15 @@ fn make_header(m: &ArchiveMember, legacy_flags: Option<u16>) -> Header {
             h.crc = *crc32;
             h.hash_type = RAR_HASH_CRC32;
             h.hash[..4].copy_from_slice(&crc32.to_le_bytes());
-            h.file_time = meta.file_time.unwrap_or(0);
+            h.file_time = match meta.stored_modification_time() {
+                Some(StoredTimestamp::DosLocal(raw)) => raw,
+                _ => 0,
+            };
             if let Some(f) = legacy_flags.map(|f| (f >> 5) & 7).filter(|&w| w != 7) {
                 h.dict_kb = 64 << f;
             }
         }
-        ArchiveMemberDetail::Rar50Plus { compression_info: ci, crc32, file_times, redirection, hash, .. } => {
+        ArchiveMemberDetail::Rar50Plus { compression_info: ci, crc32, redirection, hash, .. } => {
             h.host_os = match meta.host_os {
                 Some(0) => 2,
                 Some(1) => 3,
@@ -1397,26 +1405,27 @@ fn make_header(m: &ArchiveMember, legacy_flags: Option<u16>) -> Header {
                     }
                 }
             }
-            h.file_time = meta.file_time.map_or(0, |t| dos_from_unix(i64::from(t)));
+            h.file_time = match meta.stored_modification_time() {
+                Some(StoredTimestamp::UnixSeconds(secs)) => dos_from_unix(i64::from(secs)),
+                _ => 0,
+            };
             if let Some(r) = redirection {
                 h.redir_type = r.redirection_type as u32;
                 h.redir_name = r.target_name.clone();
                 h.dir_target = (r.flags & 1) as u32;
             }
-            if let Some(t) = file_times {
-                let ft = |x: &Option<FileTimestamp>| {
+            if let Ok(times) = m.times() {
+                let ft = |x: Option<Timestamp>| {
                     x.map_or(0, |x| filetime_from_unix_nanos(x.unix_nanoseconds()))
                 };
-                h.ctime = ft(&t.created);
-                h.atime = ft(&t.accessed);
+                h.ctime = ft(times.created);
+                h.atime = ft(times.accessed);
             }
         }
         _ => {}
     }
     if let Some(t) = meta.modification_time() {
-        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-            h.mtime = filetime_from_unix_nanos(d.as_nanos() as i128);
-        }
+        h.mtime = filetime_from_unix_nanos(t.unix_nanoseconds());
     }
     h
 }

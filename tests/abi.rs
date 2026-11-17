@@ -18,8 +18,8 @@ fn payload() -> Vec<u8> {
 
 fn build(format: ArchiveVersion, solid: bool, password: Option<&[u8]>) -> Vec<u8> {
     let mut b = Builder::new(format).solid(solid).password(password.map(<[u8]>::to_vec));
-    b.add_bytes(b"one.bin".to_vec(), payload(), Some(1_600_000_000), Some(0o100640)).unwrap();
-    b.add_bytes(b"dir/two.txt".to_vec(), b"second".to_vec(), Some(1_600_000_000), Some(0o100644))
+    b.add_bytes(b"one.bin".to_vec(), payload(), Some(rars::Timestamp::from_unix_seconds(1_600_000_000)), Some(0o100640)).unwrap();
+    b.add_bytes(b"dir/two.txt".to_vec(), b"second".to_vec(), Some(rars::Timestamp::from_unix_seconds(1_600_000_000)), Some(0o100644))
         .unwrap();
     b.to_bytes().unwrap()
 }
@@ -149,7 +149,7 @@ fn encrypted_headers_open_without_password() {
     let mut b = Builder::new(ArchiveVersion::Rar50)
         .password(Some(b"pw".to_vec()))
         .header_encryption(true);
-    b.add_bytes(b"one.bin".to_vec(), payload(), Some(1_600_000_000), Some(0o100640))
+    b.add_bytes(b"one.bin".to_vec(), payload(), Some(rars::Timestamp::from_unix_seconds(1_600_000_000)), Some(0o100640))
         .unwrap();
     std::fs::write(&arc, b.to_bytes().unwrap()).unwrap();
 
