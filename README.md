@@ -17,9 +17,11 @@ test programs against both libraries.
 
     cargo build --release
 
-Produces `target/release/libunrars.so` and `libunrars.a`. Link with `-lunrars`.
-To substitute for the original library, install it under the name your programs
-expect (e.g. `libunrar.so.5`).
+Produces `target/release/libunrars.so` (soname `libunrar.so.5`) and
+`libunrars.a`. Link with `-lunrars`. Even though the file is named
+`libunrars.so`, its embedded soname is `libunrar.so.5` (matching the original
+library's SOVERSION), so programs linking against it record a runtime
+dependency on `libunrar.so.5`.
 
 ## Known limitations
 
