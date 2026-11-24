@@ -7,6 +7,10 @@ A drop-in implementation of the `libunrar` C API (`RAROpenArchive[Ex]`,
 
 Licensed under 0BSD (see `LICENSE`).
 
+The unrar-free project has a
+[C header](https://gitlab.com/bgermann/unrar-free/-/blob/master/include/unrarchive.h)
+with the same license, which you can use instead of the original dll.hpp.
+
 ## Clean-room statement
 
 This was written without reading the unrar source code. The exported symbol names of
