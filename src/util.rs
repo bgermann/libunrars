@@ -24,45 +24,12 @@ pub fn wide_encode(ch: char, buf: &mut [wchar; 2]) -> &[wchar] {
     &buf[..1]
 }
 
-#[cfg(unix)]
-fn local_time(t: i64) -> Option<libc::tm> {
-    let t = t as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    (!unsafe { libc::localtime_r(&t, &mut tm) }.is_null()).then_some(tm)
-}
-
-#[cfg(windows)]
-fn local_time(t: i64) -> Option<libc::tm> {
-    let t = t as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    (unsafe { libc::localtime_s(&mut tm, &t) } == 0).then_some(tm)
-}
-
-/// Packs broken-down local time into a DOS date/time word (date in the high half).
+/// Converts a Unix timestamp to the packed MS-DOS date/time word (date in the
+/// high half) shown in the legacy `FileTime` header field. Resolution is two
+/// seconds and the range is 1980-2107. Delegates to rars' TZif-based local
+/// timezone handling, so no libc is involved.
 pub fn dos_from_unix(secs: i64) -> u32 {
-    let Some(tm) = local_time(secs) else {
-        return 0;
-    };
-    let year = (tm.tm_year + 1900 - 1980).clamp(0, 127) as u32;
-    let date = (year << 9) | (((tm.tm_mon + 1) as u32) << 5) | tm.tm_mday as u32;
-    let time = ((tm.tm_hour as u32) << 11) | ((tm.tm_min as u32) << 5) | (tm.tm_sec as u32 / 2);
-    (date << 16) | time
-}
-
-/// Interprets a DOS date/time word as local time and returns Unix seconds.
-#[cfg(test)]
-fn unix_from_dos(dos: u32) -> i64 {
-    let date = dos >> 16;
-    let time = dos & 0xffff;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    tm.tm_year = ((date >> 9) + 1980) as i32 - 1900;
-    tm.tm_mon = (((date >> 5) & 0xf) as i32 - 1).max(0);
-    tm.tm_mday = ((date & 0x1f) as i32).max(1);
-    tm.tm_hour = (time >> 11) as i32;
-    tm.tm_min = ((time >> 5) & 0x3f) as i32;
-    tm.tm_sec = ((time & 0x1f) * 2) as i32;
-    tm.tm_isdst = -1;
-    unsafe { libc::mktime(&mut tm) as i64 }
+    rars::timestamp::dos_time(rars::Timestamp::from_unix_seconds(secs)).unwrap_or(0)
 }
 
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
@@ -168,11 +135,5 @@ mod tests {
         assert_eq!(next_volume_name("a.r00").as_deref(), Some("a.r01"));
         assert_eq!(next_volume_name("a.r99").as_deref(), Some("a.s00"));
         assert_eq!(next_volume_name("a.001").as_deref(), Some("a.002"));
-    }
-
-    #[test]
-    fn dos_roundtrip() {
-        let t = 1_700_000_000;
-        assert_eq!(unix_from_dos(dos_from_unix(t)) / 2, t / 2);
     }
 }
