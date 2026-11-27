@@ -674,7 +674,18 @@ impl Handle {
         let mut path = self.arc_name.clone();
         while has_next_volume(self.archives.last().unwrap()) {
             let text = String::from_utf8_lossy(&path).into_owned();
-            let Some(next) = next_volume_name(&text) else { break };
+            let candidates = next_volume_names(&text);
+            // Take the candidate that names an existing volume (the non-free
+            // unrar probes the schemes in order); otherwise ask for the most
+            // likely name, which the callback may rename.
+            let Some(next) = candidates
+                .iter()
+                .find(|c| path_of(c.as_bytes()).exists())
+                .cloned()
+                .or_else(|| candidates.first().cloned())
+            else {
+                break;
+            };
             path = next.into_bytes();
             while !path_of(&path).exists() {
                 if !self.volume_callback(&mut path, RAR_VOL_ASK) {
